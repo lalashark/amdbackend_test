@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import unicodedata
 from typing import Any, Dict, List
 
 import logging
@@ -15,23 +16,16 @@ _SETTINGS = get_settings()
 _CLIENT = OpenAI(base_url=_SETTINGS.vllm_base_url, api_key=_SETTINGS.vllm_api_key)
 
 RESPONSE_INSTRUCTIONS = """
-Write a concise response using EXACTLY these section headers and bullet markers:
-Summary:
-- sentence 1 (≤ 20 words)
-- sentence 2 (optional, ≤ 20 words)
+Write a concise response using exactly these section headers:
+- Summary:
+- Installation steps:
+- Links:
 
-Installation steps:
-- step 1 (≤ 20 words)
-- step 2 (optional)
-- step 3 (optional)
-
-Links:
-- link description 1 (include URL if known)
-- link description 2 (optional)
-
-Rules:
-- Do not add other sections, code fences, or formatting.
-- Each bullet must begin with "-".
+Formatting rules:
+- Each bullet must begin with "-" and contain no more than 20 words.
+- Provide at most 2 bullets for Summary, 3 bullets for Installation steps, and 2 bullets for Links.
+- Include URLs in the Links bullets when available.
+- Do not add extra sections, code fences, or commentary.
 """
 
 
@@ -41,12 +35,12 @@ async def generate_document_summary(request: Dict[str, Any]) -> Dict[str, Any]:
 
 def _generate_sync(request: Dict[str, Any]) -> Dict[str, Any]:
     pre = request.get("preprocessed", {})
-    title = pre.get("title", "Untitled Document")
+    title = _sanitize(pre.get("title", "Untitled Document"))
     url = pre.get("url", "")
-    sections = pre.get("section_headers", [])
-    api_list = pre.get("api_list", [])
+    sections = [_sanitize(section) for section in pre.get("section_headers", [])]
+    api_list = [_sanitize(api) for api in pre.get("api_list", [])]
     section_contents = pre.get("section_contents", {})
-    context_text = _build_context_snippet(section_contents, pre.get("raw_text", ""))
+    context_text = _sanitize(_build_context_snippet(section_contents, pre.get("raw_text", "")))
 
     user_prompt = _build_prompt(title, url, sections, api_list, context_text)
 
@@ -58,7 +52,6 @@ def _generate_sync(request: Dict[str, Any]) -> Dict[str, Any]:
                 "Summarize AMD/ROCm technical docs into very short bullets."
             ),
         },
-        {"role": "system", "content": RESPONSE_INSTRUCTIONS},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -69,7 +62,16 @@ def _generate_sync(request: Dict[str, Any]) -> Dict[str, Any]:
         return parsed
 
     logger.warning("Primary document prompt failed, retrying with simplified prompt")
-    simplified_messages = _build_simplified_messages(title, url, context_text, sections)
+    simplified_prompt = _build_simplified_prompt(title, url, context_text, sections)
+    simplified_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You summarize AMD documentation into short bullet lists."
+            ),
+        },
+        {"role": "user", "content": simplified_prompt},
+    ]
     content = _call_chat(simplified_messages)
     parsed = _parse_structured_text(content)
     if parsed:
@@ -116,6 +118,14 @@ def _build_context_snippet(section_contents: Dict[str, str], raw_text: str) -> s
     return "\n\n".join(blocks)[:3500]
 
 
+def _sanitize(text: str) -> str:
+    """Normalize unicode text to ASCII to avoid vLLM returning garbage symbols."""
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    return normalized.encode("ascii", "ignore").decode("ascii")
+
+
 def _format_result(summary: str, installations: List[str], links: List[str]) -> Dict[str, Any]:
     return {
         "summary": summary,
@@ -134,7 +144,9 @@ def _build_prompt(
 ) -> str:
     section_text = "\n".join(f"- {sec}" for sec in sections[:10]) or "- (not provided)"
     api_text = ", ".join(api_list[:10]) or "(none)"
+    instructions = RESPONSE_INSTRUCTIONS.strip()
     return (
+        f"{instructions}\n\n"
         f"Document Title: {title}\n"
         f"Source URL: {url or 'N/A'}\n"
         f"Section headers:\n{section_text}\n"
@@ -145,12 +157,13 @@ def _build_prompt(
     )
 
 
-def _build_simplified_messages(
+def _build_simplified_prompt(
     title: str, url: str, context_text: str, sections: List[str]
-) -> List[Dict[str, str]]:
+) -> str:
     section_text = "\n".join(f"- {sec}" for sec in sections[:5]) or "- (not provided)"
     trimmed_text = context_text[:4000]
     simplified_prompt = (
+        f"{RESPONSE_INSTRUCTIONS.strip()}\n\n"
         f"Document Title: {title}\n"
         f"Source URL: {url or 'N/A'}\n"
         f"Section headers:\n{section_text}\n"
@@ -158,16 +171,7 @@ def _build_simplified_messages(
         f"{trimmed_text}\n"
         "Produce the bullet-format summary exactly as instructed using the exact headers."
     )
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You summarize AMD documentation into short bullet lists."
-            ),
-        },
-        {"role": "system", "content": RESPONSE_INSTRUCTIONS},
-        {"role": "user", "content": simplified_prompt},
-    ]
+    return simplified_prompt
 
 
 def _parse_structured_text(content: str) -> Dict[str, Any]:
@@ -175,7 +179,7 @@ def _parse_structured_text(content: str) -> Dict[str, Any]:
     if json_candidate:
         return json_candidate
 
-    sections = {"summary": [], "installation": [], "links": []}
+    exact_sections = {"summary": [], "installation": [], "links": []}
     current = None
     for raw_line in content.splitlines():
         line = raw_line.strip()
@@ -194,13 +198,19 @@ def _parse_structured_text(content: str) -> Dict[str, Any]:
         if current:
             cleaned = line.lstrip("-*•0123456789. ").strip()
             if cleaned:
-                sections[current].append(cleaned)
-    if not sections["summary"] and not sections["installation"]:
-        return {}
-    summary_text = " ".join(sections["summary"][:2])
-    installation = sections["installation"][:3]
-    links = sections["links"][:2]
-    return _format_result(summary_text, installation, links)
+                exact_sections[current].append(cleaned)
+    if exact_sections["summary"] or exact_sections["installation"]:
+        summary_text = " ".join(exact_sections["summary"][:2])
+        installation = exact_sections["installation"][:3]
+        links = exact_sections["links"][:2]
+        return _format_result(summary_text, installation, links)
+
+    # Fallback parser for generic markdown sections like "**Install HIP**"
+    generic = _parse_markdown_sections(content)
+    if generic:
+        return generic
+
+    return {}
 
 
 def _attempt_json_parse(content: str) -> Dict[str, Any]:
@@ -251,6 +261,66 @@ def _fallback_response(request: Dict[str, Any]) -> Dict[str, Any]:
         "context_sync_key": session_id,
     }
     return result
+
+
+def _parse_markdown_sections(content: str) -> Dict[str, Any]:
+    sections: Dict[str, List[str]] = {}
+    current_key = None
+
+    def _normalize_key(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        cleaned = raw.strip().lower()
+        return cleaned or None
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        heading = None
+        if line.startswith("**") and line.endswith("**"):
+            heading = line.strip("* ")
+        elif line.endswith(":") and len(line) < 80:
+            heading = line.strip(": ")
+
+        if heading:
+            current_key = _normalize_key(heading)
+            sections.setdefault(current_key or "summary", [])
+            continue
+
+        if line[:1] in {"-", "*"}:
+            bullet = line.lstrip("-*•0123456789. ").strip()
+            if bullet:
+                key = current_key or "summary"
+                sections.setdefault(key, []).append(bullet)
+
+    if not sections:
+        return {}
+
+    summary_lines = sections.get("summary")
+    if not summary_lines:
+        summary_lines = next(iter(sections.values()))
+
+    install_lines: List[str] = []
+    link_lines: List[str] = []
+    for key, bullets in sections.items():
+        if key and any(word in key for word in ("install", "installation", "step")):
+            install_lines.extend(bullets)
+        if key and "link" in key:
+            link_lines.extend(bullets)
+        for bullet in bullets:
+            if "http://" in bullet.lower() or "https://" in bullet.lower():
+                link_lines.append(bullet)
+
+    if not install_lines:
+        remaining = summary_lines[2:] + [
+            bullet for key, bullets in sections.items() if key != "summary" for bullet in bullets
+        ]
+        install_lines = remaining
+
+    summary_text = " ".join(summary_lines[:2])
+    return _format_result(summary_text, install_lines[:3], link_lines[:2])
 
 
 def _extract_summary(raw_text: str, sections: Dict[str, str]) -> str:

@@ -1,0 +1,27 @@
+services:
+  llm_gateway:
+    build: ./llm_gateway
+    environment:
+      - LLM_GATEWAY_MODE=${LLM_GATEWAY_MODE:-mock}
+    ports:
+      - "8001:8001"
+
+  agent_service:
+    build: ./agent_service
+    environment:
+      - LLM_GATEWAY_URL=http://llm_gateway:8001
+      - LLM_GATEWAY_TIMEOUT=10
+    depends_on:
+      - llm_gateway
+    ports:
+      - "8100:8100"
+
+  backend:
+    build: ./backend_service
+    environment:
+      - AGENT_SERVICE_URL=http://agent_service:8100
+      - AGENT_SERVICE_TIMEOUT=30
+    depends_on:
+      - agent_service
+    ports:
+      - "8000:8000"

@@ -1,0 +1,6 @@
+fastapi>=0.115.0,<0.119.0
+uvicorn[standard]>=0.34.0,<0.35.0
+google-adk>=0.0.5
+google-genai>=0.5.0
+httpx>=0.28.1,<1.0.0
+beautifulsoup4>=4.12.0
